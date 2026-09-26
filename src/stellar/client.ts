@@ -11,7 +11,6 @@
 import { rpc } from "@stellar/stellar-sdk";
 
 import type { StellarConfig } from "../config.js";
-import { networkLabel } from "../config.js";
 
 export function createRpcServer(config: StellarConfig): rpc.Server {
   return new rpc.Server(config.rpcUrl, {
@@ -24,13 +23,19 @@ export function createRpcServer(config: StellarConfig): rpc.Server {
 export const DEFAULT_EXPLORER_BASE_URL = "https://stellar.expert/explorer";
 
 /**
- * Resolve the explorer network path segment from the configured passphrase.
- * Custom / unknown networks fall back to `testnet` so links stay usable in
- * local quickstart deployments.
+ * Resolve the explorer network path segment from the configured network name.
+ * `futurenet` and `custom` fall back to `testnet` so links remain usable in
+ * local and non-standard deployments. Falls back to passphrase inference when
+ * the `network` field is absent (e.g. in tests that predate multi-network support).
  */
 export function explorerNetworkSegment(config: StellarConfig): "public" | "testnet" {
-  const label = networkLabel(config);
-  return label === "public" ? "public" : "testnet";
+  const net = config.network ?? inferFromPassphrase(config.networkPassphrase);
+  return net === "mainnet" ? "public" : "testnet";
+}
+
+function inferFromPassphrase(passphrase: string): string {
+  if (passphrase === "Public Global Stellar Network ; September 2015") return "mainnet";
+  return "testnet";
 }
 
 function explorerBase(config: StellarConfig): string {
