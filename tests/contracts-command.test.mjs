@@ -92,13 +92,14 @@ test("contractsMessage renders both contract ids, testnet explorer links, and th
   );
 });
 
-test("contractsMessage switches to the public explorer on the public network passphrase", () => {
+test("contractsMessage switches to the public explorer on mainnet", () => {
   const config = fakeConfig({
+    network: "mainnet",
     networkPassphrase: "Public Global Stellar Network ; September 2015",
   });
   const message = contractsMessage(config);
 
-  assert.match(message, /Mimir on Stellar public/);
+  assert.match(message, /Mimir on Stellar mainnet/);
   assert.match(
     message,
     new RegExp(`stellar\\.expert/explorer/public/contract/${MARKET_ID}`),

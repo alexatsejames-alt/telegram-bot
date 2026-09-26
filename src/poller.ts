@@ -27,6 +27,7 @@ import type { BotConfig } from "./config.js";
 import { formatEvent, safeErrorMessage } from "./notifications/format.js";
 import { readContractEvents, type WatchTarget } from "./stellar/events.js";
 import type { ContractSource, DecodedEvent } from "./stellar/decode.js";
+import { dedupKey } from "./stellar/decode.js";
 
 export interface TargetState {
   source: ContractSource;
@@ -34,6 +35,8 @@ export interface TargetState {
   cursor: string | null;
   /** Highest ledger an event was seen in, from this run or the cursor file. */
   lastEventLedger: number | null;
+  /** Dedup key of the last event that was successfully sent. Persisted across restarts. */
+  lastSeenEventId: string | null;
   lastError: string | null;
 }
 
@@ -68,12 +71,13 @@ export interface PollerStatus {
 interface CursorFile {
   version: 1;
   updatedAt: string;
-  targets: Record<string, { cursor: string | null; lastEventLedger: number | null }>;
+  targets: Record<string, { cursor: string | null; lastEventLedger: number | null; lastSeenEventId?: string | null }>;
 }
 
 interface CursorTarget {
   cursor: string | null;
   lastEventLedger: number | null;
+  lastSeenEventId: string | null;
 }
 
 function parseCursorFile(raw: string): CursorFile {
@@ -110,6 +114,9 @@ function parseCursorFile(raw: string): CursorFile {
     targets[source] = {
       cursor: target.cursor ?? null,
       lastEventLedger: target.lastEventLedger ?? null,
+      lastSeenEventId: typeof (target as Partial<CursorTarget>).lastSeenEventId === "string"
+        ? (target as Partial<CursorTarget>).lastSeenEventId!
+        : null,
     };
   }
 
@@ -224,7 +231,7 @@ export function createPoller(deps: PollerDeps) {
   const state = new Map<ContractSource, TargetState>(
     targets.map((t) => [
       t.source,
-      { source: t.source, contractId: t.contractId, cursor: null, lastEventLedger: null, lastError: null },
+      { source: t.source, contractId: t.contractId, cursor: null, lastEventLedger: null, lastSeenEventId: null, lastError: null },
     ]),
   );
 
@@ -278,6 +285,7 @@ export function createPoller(deps: PollerDeps) {
         if (!target) continue;
         target.cursor = saved.cursor ?? null;
         target.lastEventLedger = saved.lastEventLedger ?? null;
+        target.lastSeenEventId = saved.lastSeenEventId ?? null;
       }
       console.log(
         `[poller] resumed from ${config.cursorFile}: ` +
@@ -298,7 +306,7 @@ export function createPoller(deps: PollerDeps) {
       targets: Object.fromEntries(
         [...state.values()].map((t) => [
           t.source,
-          { cursor: t.cursor, lastEventLedger: t.lastEventLedger },
+          { cursor: t.cursor, lastEventLedger: t.lastEventLedger, lastSeenEventId: t.lastSeenEventId },
         ]),
       ),
     };
@@ -323,12 +331,24 @@ export function createPoller(deps: PollerDeps) {
     skipped: number;
   }
 
-  async function notify(events: DecodedEvent[]): Promise<NotificationResult> {
+  async function notify(events: DecodedEvent[], target: TargetState): Promise<NotificationResult> {
     let sentThisCycle = 0;
     let failed = 0;
     let skipped = 0;
+    // Once we find the first unseen event, the rest are all new (events are ordered).
+    let pastDedup = target.lastSeenEventId === null;
 
     for (const event of events) {
+      // Skip events already delivered before the last restart.
+      if (!pastDedup) {
+        if (dedupKey(event) === target.lastSeenEventId) {
+          pastDedup = true;
+        }
+        status.eventsSkipped += 1;
+        skipped += 1;
+        continue;
+      }
+
       if (event.payload.name === "unknown") {
         status.eventsSkipped += 1;
         skipped += 1;
@@ -364,6 +384,7 @@ export function createPoller(deps: PollerDeps) {
         await sendWithRetry(send, text, config.botToken, deps.sendOptions);
         status.notificationsSent += 1;
         sentThisCycle += 1;
+        target.lastSeenEventId = dedupKey(event);
       } catch (err) {
         // All retries exhausted; drop the message but continue processing others.
         status.notificationsFailed += 1;
@@ -445,7 +466,7 @@ export function createPoller(deps: PollerDeps) {
             `[poller] ${target.source}: ${scan.events.length} event(s) ` +
               `up to ledger ${scan.lastEventLedger} in ${scan.pages} page(s)`,
           );
-          delivery = await notify(scan.events);
+          delivery = await notify(scan.events, current);
         }
 
         if (scan.lastEventLedger !== null) current.lastEventLedger = scan.lastEventLedger;

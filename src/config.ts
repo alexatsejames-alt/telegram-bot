@@ -35,7 +35,33 @@ import {
   MOCK_SQUAD_CONTRACT_ID,
 } from "./stellar/mock-constants.js";
 
+/** Named Stellar networks the bot understands. `custom` is any other passphrase. */
+export type StellarNetwork = "testnet" | "mainnet" | "futurenet" | "custom";
+
+/** Well-known passphrase for each named network. */
+export const NETWORK_PASSPHRASES: Record<Exclude<StellarNetwork, "custom">, string> = {
+  testnet: "Test SDF Network ; September 2015",
+  mainnet: "Public Global Stellar Network ; September 2015",
+  futurenet: "Test SDF Future Network ; October 2022",
+};
+
+/** Well-known RPC URLs for each named network. */
+export const NETWORK_RPC_URLS: Record<Exclude<StellarNetwork, "custom">, string> = {
+  testnet: "https://soroban-testnet.stellar.org",
+  mainnet: "https://mainnet.stellar.validationcloud.io/v1/xycpM7GHpnTdRwOxOIuEiZwmQXXOWpSqHdlHqbNXSeo",
+  futurenet: "https://rpc-futurenet.stellar.org",
+};
+
+/** Well-known Horizon URLs for each named network. */
+export const NETWORK_HORIZON_URLS: Record<Exclude<StellarNetwork, "custom">, string> = {
+  testnet: "https://horizon-testnet.stellar.org",
+  mainnet: "https://horizon.stellar.org",
+  futurenet: "https://horizon-futurenet.stellar.org",
+};
+
 export interface StellarConfig {
+  /** Named network, derived from STELLAR_NETWORK or inferred from the passphrase. */
+  network?: StellarNetwork;
   marketContractId: string;
   squadContractId: string;
   rpcUrl: string;
@@ -84,9 +110,10 @@ export class ConfigError extends Error {
 }
 
 const DEFAULTS = {
-  rpcUrl: "https://soroban-testnet.stellar.org",
-  horizonUrl: "https://horizon-testnet.stellar.org",
-  networkPassphrase: "Test SDF Network ; September 2015",
+  network: "testnet" as StellarNetwork,
+  rpcUrl: NETWORK_RPC_URLS.testnet,
+  horizonUrl: NETWORK_HORIZON_URLS.testnet,
+  networkPassphrase: NETWORK_PASSPHRASES.testnet,
   pollIntervalMs: 30_000,
   minPollIntervalMs: 5_000,
   startLookbackLedgers: 60,
@@ -108,6 +135,7 @@ const CONTRACT_ID_RE = /^C[A-Z2-7]{55}$/;
  */
 const PROFILE_DEFAULTS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
   [MOCK_PROFILE_NAME]: {
+    STELLAR_NETWORK: "custom",
     MARKET_CONTRACT_ID: MOCK_MARKET_CONTRACT_ID,
     SQUAD_CONTRACT_ID: MOCK_SQUAD_CONTRACT_ID,
     STELLAR_RPC_URL: `http://127.0.0.1:${MOCK_RPC_DEFAULT_PORT}`,
@@ -270,16 +298,41 @@ function collector(profile: Record<string, string>) {
       }
       return value;
     },
+
+    network(name: string, fallback: StellarNetwork): StellarNetwork {
+      const value = get(name);
+      if (value === undefined) return fallback;
+      const valid: StellarNetwork[] = ["testnet", "mainnet", "futurenet", "custom"];
+      if (!valid.includes(value as StellarNetwork)) {
+        problems.push(
+          `${name} must be one of ${valid.join(", ")}; got "${value}"`,
+        );
+        return fallback;
+      }
+      return value as StellarNetwork;
+    },
   };
 }
 
 function stellarFrom(c: ReturnType<typeof collector>): StellarConfig {
+  const network = c.network("STELLAR_NETWORK", DEFAULTS.network);
+  const namedDefaults = network !== "custom" ? {
+    rpcUrl: NETWORK_RPC_URLS[network],
+    horizonUrl: NETWORK_HORIZON_URLS[network],
+    passphrase: NETWORK_PASSPHRASES[network],
+  } : {
+    rpcUrl: DEFAULTS.rpcUrl,
+    horizonUrl: DEFAULTS.horizonUrl,
+    passphrase: DEFAULTS.networkPassphrase,
+  };
+
   return {
+    network,
     marketContractId: c.contractId("MARKET_CONTRACT_ID"),
     squadContractId: c.contractId("SQUAD_CONTRACT_ID"),
-    rpcUrl: c.url("STELLAR_RPC_URL", DEFAULTS.rpcUrl),
-    horizonUrl: c.url("STELLAR_HORIZON_URL", DEFAULTS.horizonUrl),
-    networkPassphrase: c.get("STELLAR_NETWORK_PASSPHRASE") ?? DEFAULTS.networkPassphrase,
+    rpcUrl: c.url("STELLAR_RPC_URL", namedDefaults.rpcUrl),
+    horizonUrl: c.url("STELLAR_HORIZON_URL", namedDefaults.horizonUrl),
+    networkPassphrase: c.get("STELLAR_NETWORK_PASSPHRASE") ?? namedDefaults.passphrase,
     explorerBaseUrl: c.url(
       "STELLAR_EXPLORER_BASE_URL",
       "https://stellar.expert/explorer",
@@ -325,10 +378,20 @@ export function loadConfig(): BotConfig {
   return config;
 }
 
-/** `mock` / `testnet` / `public` / `unknown`, derived from the passphrase. Display only. */
+/** Display label for the active Stellar network. */
 export function networkLabel(config: StellarConfig): string {
-  if (config.networkPassphrase === MOCK_NETWORK_PASSPHRASE) return "mock";
-  if (config.networkPassphrase === "Test SDF Network ; September 2015") return "testnet";
-  if (config.networkPassphrase === "Public Global Stellar Network ; September 2015") return "public";
+  const net = config.network ?? inferNetwork(config.networkPassphrase);
+  if (net === "custom") {
+    if (config.networkPassphrase === MOCK_NETWORK_PASSPHRASE) return "mock";
+    return "custom";
+  }
+  return net;
+}
+
+/** Derive a StellarNetwork from a passphrase when the field is absent (backward compat). */
+function inferNetwork(passphrase: string): StellarNetwork {
+  if (passphrase === NETWORK_PASSPHRASES.mainnet) return "mainnet";
+  if (passphrase === NETWORK_PASSPHRASES.testnet) return "testnet";
+  if (passphrase === NETWORK_PASSPHRASES.futurenet) return "futurenet";
   return "custom";
 }
