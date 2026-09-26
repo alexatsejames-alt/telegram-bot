@@ -443,6 +443,19 @@ function decodeSquad(
 
 // ── Entry point ──────────────────────────────────────────────────────────────
 
+/**
+ * Stable deduplication key for a decoded event.
+ *
+ * The RPC's `eventId` is already globally unique and monotonically ordered
+ * (`<TOID>-<opIndex>`), so it is the natural dedup token. Falls back to
+ * `<txHash>-<ledger>` for events where the id is missing or empty (e.g. in
+ * unit-test fakes that predate the field).
+ */
+export function dedupKey(event: Pick<EventMeta, "eventId" | "txHash" | "ledger">): string {
+  if (event.eventId && event.eventId.length > 0) return event.eventId;
+  return `${event.txHash || "?"}:${event.ledger}`;
+}
+
 /** `event.contractId` is a `Contract` on some SDK paths and a string on others. */
 function contractIdOf(event: rpc.Api.EventResponse): string {
   if (!event || typeof event !== "object") return "";
