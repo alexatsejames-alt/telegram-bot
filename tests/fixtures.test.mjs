@@ -114,7 +114,7 @@ test("fixture claim_challenged reaches Telegram via fake notifier", async () => 
 
   await createNotifier(fakeBot, catalog.config)(message);
   assert.equal(sent.length, 1);
-  assert.equal(sent[0][0], catalog.config.chatId);
+  assert.equal(sent[0][0], catalog.config.chatIds[0]);
   assert.equal(sent[0][1], message);
   assert.equal(sent[0][2].parse_mode, "MarkdownV2");
 });
@@ -127,7 +127,7 @@ test("Telegram send failure from fixture path preserves the error (no token leak
       sendMessage: async () => Promise.reject(error),
     },
   };
-  const notify = createNotifier(fakeBot, { chatId: catalog.config.chatId });
+  const notify = createNotifier(fakeBot, { chatIds: catalog.config.chatIds });
   await assert.rejects(notify("fixture-message"), (err) => {
     assert.equal(err, error);
     assert.doesNotMatch(String(err), /BOT_TOKEN/);

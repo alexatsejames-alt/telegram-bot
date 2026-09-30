@@ -9,7 +9,7 @@ const SQUAD_ID = "C".padEnd(56, "S");
 function fakeConfig(overrides = {}) {
   return {
     botToken: "TEST_TOKEN",
-    chatId: "-1001234567890",
+    chatIds: ["-1001234567890"],
     marketContractId: MARKET_ID,
     squadContractId: SQUAD_ID,
     rpcUrl: "https://soroban-testnet.stellar.org",
@@ -114,7 +114,7 @@ test("/contracts reaches Telegram as the exact MarkdownV2 payload, unaffected by
   await bot.handleUpdate(commandUpdate("/contracts"));
 
   // ctx.reply targets the chat the update came from (a number here), not
-  // config.chatId (used only by the poller's separate createNotifier path).
+  // config.chatIds[0] (used only by the poller's separate createNotifier path).
   // Compare the fields this handler controls rather than the whole payload:
   // grammy's Api layer adds its own undefined-valued fields to the object.
   assert.equal(sent.length, 1);
@@ -227,5 +227,5 @@ test("registerCommands includes /contracts alongside the existing commands", asy
 
   assert.equal(calls.length, 1);
   const commands = calls[0].commands.map((c) => c.command);
-  assert.deepEqual(commands, ["start", "help", "status", "contracts", "health", "preview", "pause", "resume"]);
+  assert.deepEqual(commands, ["start", "help", "status", "audit", "contracts", "health", "preview", "pause", "resume"]);
 });

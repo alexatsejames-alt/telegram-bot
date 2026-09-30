@@ -59,7 +59,7 @@ Configuration is loaded from environment variables with support for profiles (`M
 **Configuration categories:**
 - **Telegram**: `BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `ALLOWED_CHAT_IDS`, `OPERATOR_TELEGRAM_USER_ID`
 - **Stellar**: `MARKET_CONTRACT_ID`, `SQUAD_CONTRACT_ID`, `STELLAR_RPC_URL`, `STELLAR_HORIZON_URL`, `STELLAR_NETWORK_PASSPHRASE`
-- **Poller**: `POLL_INTERVAL_MS`, `START_LOOKBACK_LEDGERS`, `CURSOR_FILE`, `MAX_NOTIFICATIONS_PER_CYCLE`
+- **Poller**: `POLL_INTERVAL_MS`, `START_LOOKBACK_LEDGERS`, `CURSOR_FILE`, `MAX_NOTIFICATIONS_PER_CYCLE`, `EVENT_DEDUP_WINDOW`
 - **Health**: `HEALTH_HOST`, `HEALTH_PORT`, `HEALTH_STALE_MS`
 - **Display**: `CHANNEL_PREVIEW_MODE`
 
@@ -76,8 +76,9 @@ The poller is the central orchestrator that runs a recurring loop to scan contra
 - **Status reporting**: Maintains counters and last-error information
 
 **State management:**
-- Per-target state: `cursor` (opaque string), `lastEventLedger` (number), `lastError` (string)
-- Global counters: `cycles`, `notificationsSent`, `notificationsFailed`, `eventsSkipped`, `consecutiveFailures`
+- Per-target state: `cursor` (opaque string), `lastEventLedger` (number), `rewindFromLedger` (the retained floor a stale cursor is being recovered from, else `null`), `lastError` (string)
+- Global counters: `cycles`, `notificationsSent`, `notificationsFailed`, `eventsSkipped`, `eventsDeduplicated`, `cursorRewinds`, `consecutiveFailures`
+- Chain clock: `chainClockAt`, the newest close time actually observed (monotonic, persisted with the cursors); skew is derived as `now - chainClockAt`
 
 ### Scanner (`src/stellar/events.ts`)
 
@@ -87,8 +88,14 @@ The scanner handles cursor-paginated event retrieval from Soroban RPC. It is des
 - **Sequential pagination**: Uses opaque cursors; cannot parallelize
 - **Mutual exclusion**: `startLedger`/`endLedger` and `cursor` are mutually exclusive in requests
 - **Retention awareness**: Queries `getHealth()` to get the retained-history floor
+- **Window validation**: The floor and tip are validated before the first request; a start ledger below the floor is clamped up, and a start ledger above the tip or a resume cursor above the tip is refused with a bounded error. A cursor below the floor is still forwarded, so retention stays the RPC's call — and when the RPC rejects it as stale, the poller may rewind to the floor (see [Stale Cursor](#stale-cursor))
 - **Page termination**: Walk stops when cursor stops moving or reaches chain tip
 - **Bounded scanning**: Limited to `EVENT_MAX_PAGES` (20) pages per scan
+- **Inline dedup**: Each raw event is keyed by the canonical `eventKey()`
+  (`src/dedup.ts`) against a window seeded from the cursor file; repeats from an
+  overlapping page are dropped and counted, and the walk's resulting window is
+  returned as `seenEventIds` so the poller persists exactly what the next cycle
+  must suppress
 
 **API surface:**
 - `paginatedGetEvents()`: Low-level cursor-paginated event retrieval
@@ -127,7 +134,7 @@ The bot uses grammy for Telegram integration with a thin command layer and a sin
 
 **Command handlers:**
 - `/start`, `/help`: Bot information and command list
-- `/status`: Poller state, cursors, counters, last error
+- `/status`: Poller state, chain clock skew, cursors, counters, last error
 - `/health`: Health assessment and operational readiness
 - `/contracts`: Contract IDs and explorer links
 - `/preview`: Preview notification formatting
@@ -151,9 +158,19 @@ Local HTTP endpoint for process supervisors and deploy checks. Bound to loopback
 - **degraded**: Poller running but stale or failing repeatedly
 - **stopped**: Poller not running
 
+**Chain clock:**
+- `poller.chainClockAt`: newest observed chain close time (ISO 8601), or `null`
+- `poller.chainClockSkewMs`: `checkedAt - chainClockAt` in milliseconds; positive while the bot is ahead of the chain, `null` before the first observation
+
+**Configuration provenance:**
+- `config`: each setting's name and the source that supplied it (`process-env`, `env-file`, `profile-default`, `built-in-default`, `derived`, `unset`), plus per-source counts and actionable warnings
+- Values are never included, secret or not, so the section is safe to publish; `secret: true` marks which settings are sensitive
+- The boot log prints the same report as one line (`formatProvenanceSummary`)
+
 **Safety:**
 - JSON-only responses
 - No bot tokens, private keys, or unbounded payloads
+- No configuration values of any kind, only names and origins
 - Client errors logged and ignored
 
 ### RPC Client (`src/stellar/client.ts`)
@@ -170,18 +187,19 @@ Thin wrapper around Stellar SDK's `rpc.Server` with explorer URL helpers.
 ### Event Processing Pipeline
 
 1. **Poller cycle** starts on schedule
-2. **Scanner** queries Soroban RPC with cursor or start ledger
+2. **Scanner** queries Soroban RPC with cursor or start ledger, seeded with the persisted dedup window
 3. **RPC** returns events with opaque cursor for next page
-4. **Decoder** converts raw events to typed objects
-5. **Formatter** creates MarkdownV2 messages
-6. **Send function** delivers via Telegram API with retry
-7. **Cursor** is committed after page processing (including failures)
-8. **Health server** reflects current status
+4. **Dedup** drops any raw event whose canonical key (`eventKey()`) the window already holds, and counts it
+5. **Decoder** converts raw events to typed objects
+6. **Formatter** creates MarkdownV2 messages
+7. **Send function** delivers via Telegram API with retry
+8. **Window + cursor**: the walk's keys (`seenEventIds`) are recorded before notifying, then the cursor is committed after page processing (including failures)
+9. **Health server** reflects current status
 
 ### Cursor Lifecycle
 
 ```
-Load from file → Use in RPC request → Receive new cursor → Process events → Save to file
+Load from file (cursor + dedup window) → Use in RPC request → Receive new cursor → Dedup by canonical key → Process events → Save to file
 ```
 
 ## Failure Handling
@@ -191,6 +209,26 @@ Load from file → Use in RPC request → Receive new cursor → Process events 
 - **Decoder behavior**: `decodeEvent()` never throws; malformed events become `unknown` payloads
 - **Poller behavior**: Unknown events are logged and skipped for Telegram
 - **Cursor impact**: None; cursor advances normally
+- **Non-object RPC entries**: Skipped by the reader before decoding — never a crash
+- **Unkeyable events**: An event with no `id`/`eventId`, no `txHash`, or topic
+  content that cannot be encoded derives no dedup key (`null`) and passes
+  through **undeduplicated**: at worst one duplicate notification, never a
+  wrongly suppressed event
+
+### Duplicate / Redelivered Events
+
+- **Key**: One canonical derivation (`eventKey()` in `src/dedup.ts`): RPC paging
+  token → `eventId` → content-derived `v2:` composite → `null` (pass through).
+  Scanner, poller, and replay all share it
+- **Bounded**: `EVENT_DEDUP_WINDOW` keys per contract (default 256, oldest
+  evicted first, `0` disables); a redelivery older than the window may repeat
+  — accepted for O(1) memory
+- **Cursor impact**: None; a suppressed duplicate never holds the cursor back
+- **Persistence**: The window round-trips through `recentEventIds` in the
+  version-1 cursor file; mixed key generations (raw TOIDs, `v2:` composites,
+  retired formats) coexist as opaque strings
+- **Observability**: `duplicates=` in scan output, `eventsDeduplicated` in
+  `GET /health` and `status.json`, `deduped` in `/status`
 
 ### RPC Failure
 
@@ -208,14 +246,33 @@ Load from file → Use in RPC request → Receive new cursor → Process events 
 
 ### Stale Cursor
 
-- **Corrupt file**: Treated as cold start
-- **RPC-rejected cursor**: Kept unchanged; error visible in `/status`
-- **Recovery**: Follow incident runbook, not automatic rewind
+- **Corrupt file**: Quarantined beside the live path and treated as a cold start.
+- **Cursor below the retained floor**: The poller asks `getHealth()` for a fresh
+  window and acts only when the cursor's own ledger places it strictly below
+  `oldestLedger`. It then drops the unreachable cursor and rescans from the floor
+  with `startLedger` (never both `cursor` and `startLedger`, which are mutually
+  exclusive). Everything below the floor was already unreadable, so nothing still
+  retrievable is skipped.
+- **Bounded**: At most `MAX_FLOOR_REWINDS` (3) consecutive automatic rewinds per
+  contract; the budget resets only once a scan returns an in-window cursor. A
+  misbehaving RPC cannot make the poller thrash.
+- **Conservative**: An opaque/unplaceable cursor, an ahead-of-tip cursor, or a
+  window that cannot be read is left untouched, with the bounded RPC error
+  surfaced in `/status`.
+- **Observability**: `cursorRewinds` (global) and the per-target
+  `rewindFromLedger` appear in `/status`, the status snapshot, and `GET /health`;
+  the miss is logged as a bounded ledger count, never a raw payload.
+- **Operator path**: Once the rewind budget is spent, or when the position cannot
+  be placed, recovery follows the incident runbook (a deliberate cold start)
+  rather than further automatic rewinds.
 
 ### Restart Behavior
 
 - **Cold start**: No cursor file → begin `START_LOOKBACK_LEDGERS` behind tip
 - **Resume**: Load cursor file → continue from last persisted position
+- **Mid-recovery resume**: A persisted `rewindFromLedger` resumes the floor walk
+  instead of cold-starting; the field is dropped once the scan returns a fresh
+  resume cursor
 - **Pause state**: Process-local; lost on restart
 
 ### Rate Limits
@@ -379,7 +436,7 @@ curl -s http://127.0.0.1:8787/health/live | jq
 
 - Deploy previous build
 - Start against same `CURSOR_FILE`
-- Cursor format unchanged (version 1)
+- Cursor format unchanged (version 1); dedup window entries are opaque strings, so mixed key generations load harmlessly
 - Chain remains source of truth
 
 ## Contribution Workflow

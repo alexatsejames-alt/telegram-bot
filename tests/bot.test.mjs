@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 
+import { auditEntry, createAuditLog } from "../dist/audit.js";
 import {
+  createNotifier,
   registerCommandHandlers,
   resumeMessage,
 } from "../dist/bot.js";
@@ -21,7 +26,7 @@ function baseConfig(overrides = {}) {
     networkPassphrase: "Test SDF Network ; September 2015",
     explorerBaseUrl: "https://example.invalid/explorer",
     botToken: "123456789:TEST-ONLY-TOKEN-NEVER-USE",
-    chatId: "-1001234567890",
+    chatIds: ["-1001234567890"],
     operatorTelegramUserId: "42",
     pollIntervalMs: 30_000,
     startLookbackLedgers: 60,
@@ -30,6 +35,8 @@ function baseConfig(overrides = {}) {
     healthHost: "127.0.0.1",
     healthPort: 0,
     healthStaleMs: 90_000,
+    webhookUrl: null,
+    telegramWebhookUrl: null,
     ...overrides,
   };
 }
@@ -113,6 +120,33 @@ test("operator /resume sends the exact MarkdownV2 payload and calls poller resum
   ]);
 });
 
+test("/status surfaces the dedup counter and never the bot token", async () => {
+  const { handlers } = mockedBot({
+    config: baseConfig({ allowedChatIds: [] }),
+    status: () =>
+      baseStatus({ cycles: 5, notificationsSent: 3, eventsSkipped: 1, eventsDeduplicated: 4 }),
+  });
+  const replies = [];
+  const ctx = {
+    from: { id: 42 },
+    chat: { id: -1001234567890 },
+    update: { update_id: 74 },
+    reply: async (...args) => {
+      replies.push(args);
+    },
+  };
+
+  await handlers.get("status")(ctx);
+
+  assert.equal(replies.length, 1);
+  const [[text, options]] = replies;
+  assert.deepEqual(options, TELEGRAM_OPTIONS);
+  assert.ok(text.includes("Cycles: 5"), "cycle counts remain visible");
+  assert.ok(text.includes("deduped 4"), "the dedup counter is actionable in /status");
+  assert.doesNotMatch(text, /TEST-ONLY-TOKEN/, "bot token must never appear");
+  assert.doesNotMatch(text, /123456789/, "token prefix must never appear");
+});
+
 test("non-operator /resume is ignored without mutating state or replying", async () => {
   let resumeCalls = 0;
   const { handlers } = mockedBot({
@@ -157,6 +191,82 @@ test("operator controls are disabled when no operator id is configured", async (
   assert.deepEqual(replies, []);
 });
 
+test("operator /audit renders the report from the live in-memory window", async () => {
+  const auditFile = path.join(
+    fs.mkdtempSync(path.join(os.tmpdir(), "mimir-audit-gate-")),
+    "audit.jsonl",
+  );
+  const audit = createAuditLog();
+  audit.record(auditEntry("boot", { detail: "test boot entry" }));
+
+  const { handlers } = mockedBot({
+    config: baseConfig(),
+    status: () => baseStatus(),
+    pause: () => "paused",
+    resume: () => "resumed",
+    audit,
+    auditFile,
+  });
+  const { ctx, replies } = commandContext(42, 81);
+
+  await handlers.get("audit")(ctx);
+
+  assert.equal(replies.length, 1);
+  const [text, options] = replies[0];
+  assert.match(text, /^\*Audit\* — /);
+  assert.match(text, /boot/);
+  assert.equal(options.parse_mode, undefined);
+
+  fs.rmSync(path.dirname(auditFile), { recursive: true, force: true });
+});
+
+test("non-operator /audit is silently ignored without reading the file or replying", async () => {
+  const auditFile = path.join(
+    fs.mkdtempSync(path.join(os.tmpdir(), "mimir-audit-gate-")),
+    "audit.jsonl",
+  );
+  let auditReadCalls = 0;
+  const audit = {
+    record: () => undefined,
+    tail: () => {
+      auditReadCalls += 1;
+      return [];
+    },
+    flush: () => [],
+  };
+
+  const { handlers } = mockedBot({
+    config: baseConfig(),
+    status: () => baseStatus(),
+    pause: () => "paused",
+    resume: () => "resumed",
+    audit,
+    auditFile,
+  });
+  const { ctx, replies } = commandContext(43, 82);
+
+  await withoutWarnings(() => handlers.get("audit")(ctx));
+
+  assert.deepEqual(replies, []);
+  assert.equal(auditReadCalls, 0);
+
+  fs.rmSync(path.dirname(auditFile), { recursive: true, force: true });
+});
+
+test("operator controls disabled means /audit is ignored even for the right user id", async () => {
+  const { handlers } = mockedBot({
+    config: baseConfig({ operatorTelegramUserId: null }),
+    status: () => baseStatus(),
+    pause: () => "paused",
+    resume: () => "resumed",
+  });
+  const { ctx, replies } = commandContext(42, 83);
+
+  await withoutWarnings(() => handlers.get("audit")(ctx));
+
+  assert.deepEqual(replies, []);
+});
+
 test("idempotent and shutdown resume results have bounded exact replies", () => {
   assert.equal(resumeMessage("already-running"), "*Polling is already running*");
   assert.equal(
@@ -177,6 +287,14 @@ test("safeErrorMessage redacts Telegram-shaped tokens and clips remote payloads"
   assert.equal(message.includes(upstreamToken), false);
   assert.equal(message.length, 240);
   assert.match(message, /^\[REDACTED] \[REDACTED] remote-payload/);
+});
+
+test("safeErrorMessage redacts tokens ending in URL punctuation", () => {
+  const hyphenToken = "123456789:BOT-TOKEN-ABCDEFGHIJKLMN-";
+  const underscoreToken = "987654321:BOT_TOKEN_ZYXWVUTSRQPON_";
+  const message = safeErrorMessage(new Error(`${hyphenToken}, ${underscoreToken}.`));
+
+  assert.equal(message, "[REDACTED], [REDACTED].");
 });
 
 test("/preview command sends exact MarkdownV2 preview payload for market and squad", async () => {
